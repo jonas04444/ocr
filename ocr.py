@@ -40,12 +40,7 @@ RED    = "\033[91m"
 GREY   = "\033[90m"
 
 
-def banner():
-    print(f"""
-{CYAN}{BOLD}╔══════════════════════════════════════════╗
-║     🔍 Lecteur de lignes numériques     ║
-╚══════════════════════════════════════════╝{RESET}
-""")
+
 
 
 def pretraiter_image(image_pil):
@@ -161,7 +156,7 @@ def extraire_lignes_numeriques(image_pil):
 
 
 def afficher_resultats(lignes):
-    """Affiche les résultats détectés dans le terminal."""
+
     if not lignes:
         print(f"{YELLOW}⚠  Aucune ligne numérique détectée.{RESET}")
         print(f"{GREY}   Conseils : vérifiez la qualité/résolution de l'image.{RESET}\n")
@@ -256,7 +251,6 @@ def afficher_image(img_cv, titre="Lignes numériques détectées", chemin_fallba
 #  Point d'entrée principal
 # ─────────────────────────────────────────────────
 def main():
-    banner()
 
     parser = argparse.ArgumentParser(
         description="Détecte et affiche les lignes contenant des chiffres dans une image.",
