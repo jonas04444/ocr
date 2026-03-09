@@ -153,7 +153,6 @@ def detecter_zone_plaque(img_bgr, debug=False):
 
     return candidates[:5]   # garder les 5 meilleures
 
-
 # ══════════════════════════════════════════════════════════════
 #  ÉTAPE 2 — Correction de perspective / angle
 # ══════════════════════════════════════════════════════════════
