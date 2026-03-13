@@ -1,554 +1,575 @@
 #!/usr/bin/env python3
 """
-╔══════════════════════════════════════════════════════╗
-║    🚗 Lecteur de Plaques Belges — Version Optimisée  ║
-║    Format : 1-ABC-234  |  Photos distance / angle    ║
-╚══════════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════════════╗
+║   🎥 Lecteur de Plaques Belges — EasyOCR Edition            ║
+║   Bien plus précis que Tesseract sur vidéo / flou / angle   ║
+║                                                              ║
+║   Webcam : python plaque_video_easyocr.py --webcam          ║
+║   MP4    : python plaque_video_easyocr.py --video film.mp4  ║
+║                                                              ║
+║   Touches :  ESPACE → pause/reprise   Q → quitter           ║
+╚══════════════════════════════════════════════════════════════╝
 
-Usage :
-    python plaque_belge.py <image>
-    python plaque_belge.py <image> --save resultat.png
-    python plaque_belge.py <image> --debug        ← affiche chaque étape
+Installation :
+    pip install easyocr opencv-python numpy
+    (EasyOCR télécharge ses modèles automatiquement au 1er lancement ~100 Mo)
 """
 
-import sys, re, os, argparse
+import sys, re, os, argparse, time, threading, queue
+from datetime import datetime
+
 import cv2
 import numpy as np
 
+# ── EasyOCR ──────────────────────────────────────────────────
 try:
-    import pytesseract
+    import easyocr
 except ImportError:
-    print("[ERREUR] pip install pytesseract pillow opencv-python")
+    print("[ERREUR] EasyOCR non installé.")
+    print("  → pip install easyocr")
     sys.exit(1)
 
-# ── Couleurs terminal ──────────────────────────────────────────
-R="\033[0m"; B="\033[1m"; CYAN="\033[96m"; GRN="\033[92m"
+# ── Couleurs terminal ─────────────────────────────────────────
+RS="\033[0m"; B="\033[1m"; CYAN="\033[96m"; GRN="\033[92m"
 YLW="\033[93m"; RED="\033[91m"; GRY="\033[90m"
 
-# ── Format plaque belge ────────────────────────────────────────
-# Nouvelle : 1-ABC-234   (depuis 2010)
-# Ancienne : ABC-123     (avant 2010, encore en circulation)
+# ── Patterns plaques belges ───────────────────────────────────
 PATTERN_NOUVELLE = re.compile(r'^[0-9]-[A-Z]{3}-[0-9]{3}$')
 PATTERN_ANCIENNE = re.compile(r'^[A-Z]{1,3}-[0-9]{1,4}-[A-Z]{0,3}$')
 
-# ── Corrections caractères courants ────────────────────────────
-# Position connue dans la plaque → forcer lettre ou chiffre
-CORRECTIONS_OCR = {
-    # Chiffres souvent confondus avec des lettres
-    'O': '0', 'o': '0', 'Q': '0',
-    'I': '1', 'l': '1', '|': '1',
-    'Z': '2', 'z': '2',
-    'S': '5', 's': '5',
-    'G': '6', 'b': '6',
-    'B': '8',
-    'g': '9',
-}
-
-def banner():
-    print(f"""
-{CYAN}{B}╔══════════════════════════════════════════════╗
-║  🚗 Lecteur de Plaques Belges — Optimisé    ║
-╚══════════════════════════════════════════════╝{R}
-""")
+# ── Couleurs affichage vidéo (BGR) ────────────────────────────
+CLR_VALIDE   = ( 50, 220,  50)
+CLR_CANDIDAT = (  0, 165, 255)
+CLR_OVERLAY  = ( 20,  20,  20)
+CLR_PAUSE    = (  0, 200, 255)
 
 
 # ══════════════════════════════════════════════════════════════
-#  ÉTAPE 1 — Détection de la zone plaque
+#  INITIALISATION EASYOCR (une seule fois au démarrage)
 # ══════════════════════════════════════════════════════════════
-def detecter_zone_plaque(img_bgr, debug=False):
+
+def init_reader():
     """
-    Localise la plaque dans l'image via :
-      1. Filtre de couleur (blanc / jaune belge)
-      2. Détection de contours rectangulaires
-      3. Score de confiance (ratio largeur/hauteur ~4.5)
-    Retourne la liste des ROI candidates, triées par score.
+    Crée le reader EasyOCR.
+    - lang=['en'] suffit pour les plaques (chiffres + lettres latines)
+    - gpu=False : fonctionne sur tous les PC sans carte graphique
+    - Les modèles (~100 Mo) sont téléchargés automatiquement la 1ère fois
+      dans ~/.EasyOCR/
+    """
+    print(f"{CYAN}⚙  Chargement du modèle EasyOCR...{RS}")
+    print(f"{GRY}   (1ère fois : téléchargement ~100 Mo, patientez){RS}\n")
+    reader = easyocr.Reader(
+        ['en'],
+        gpu=False,
+        # Désactive les messages verbeux d'EasyOCR
+        verbose=False,
+    )
+    print(f"{GRN}✅ Modèle chargé.{RS}\n")
+    return reader
+
+
+# ══════════════════════════════════════════════════════════════
+#  DÉTECTION ZONE PLAQUE (inchangée — elle fonctionne bien)
+# ══════════════════════════════════════════════════════════════
+
+def detecter_zone_plaque(img_bgr):
+    """
+    Localise les zones candidates pour une plaque :
+      A. Filtre couleur blanc (plaques belges récentes)
+      B. Filtre couleur jaune (particuliers)
+      C. Gradient morphologique (robuste la nuit / distance)
     """
     h_img, w_img = img_bgr.shape[:2]
     candidates = []
-
-    # ── Méthode A : filtre couleur blanche (plaques récentes) ──
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-    masque_blanc = cv2.inRange(hsv,
-                               np.array([0,   0, 180]),
-                               np.array([180, 40, 255]))
 
-    # ── Méthode B : filtre couleur jaune (plaques particuliers) ─
-    masque_jaune = cv2.inRange(hsv,
-                                np.array([18, 60, 100]),
-                                np.array([35, 255, 255]))
+    masque_blanc = cv2.inRange(hsv, np.array([0,   0, 170]), np.array([180, 50, 255]))
+    masque_jaune = cv2.inRange(hsv, np.array([18,  60, 100]), np.array([35, 255, 255]))
 
     for nom, masque in [("blanc", masque_blanc), ("jaune", masque_jaune)]:
-        # Morphologie pour remplir les trous
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 5))
-        masque = cv2.morphologyEx(masque, cv2.MORPH_CLOSE, kernel)
-        masque = cv2.morphologyEx(masque, cv2.MORPH_OPEN,  kernel)
-
+        k = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 5))
+        masque = cv2.morphologyEx(masque, cv2.MORPH_CLOSE, k)
+        masque = cv2.morphologyEx(masque, cv2.MORPH_OPEN,  k)
         contours, _ = cv2.findContours(masque, cv2.RETR_EXTERNAL,
                                        cv2.CHAIN_APPROX_SIMPLE)
-
         for c in contours:
             aire = cv2.contourArea(c)
-            if aire < 1000:   # trop petit
+            if aire < 600:
                 continue
-            rect = cv2.minAreaRect(c)
-            (cx, cy), (rw, rh), angle = rect
-            if rw < rh:
-                rw, rh = rh, rw   # toujours largeur > hauteur
-
-            if rh < 5:
-                continue
+            _, (rw, rh), _ = cv2.minAreaRect(c)
+            if rw < rh: rw, rh = rh, rw
+            if rh < 5:  continue
             ratio = rw / rh
-            # Plaque belge ≈ 520×113 mm → ratio ≈ 4.6
             score_ratio = 1.0 - abs(ratio - 4.6) / 4.6
-            if score_ratio < 0.2:
-                continue
-
-            # Score surface relative
+            if score_ratio < 0.18: continue
             score_aire = min(aire / (w_img * h_img * 0.15), 1.0)
-
             score = score_ratio * 0.7 + score_aire * 0.3
             x, y, w, hh = cv2.boundingRect(c)
-            candidates.append({
-                'x': x, 'y': y, 'w': w, 'h': hh,
-                'score': score, 'methode': nom, 'angle': angle
-            })
+            candidates.append({'x':x,'y':y,'w':w,'h':hh,'score':score,'methode':nom})
 
-        if debug:
-            _debug_show(f"Masque couleur ({nom})", masque)
-
-    # ── Méthode C : gradient (fonctionne mieux la nuit / distance) ─
+    # Gradient
     gris = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    gris = cv2.GaussianBlur(gris, (5, 5), 0)
-    grad_x = cv2.Sobel(gris, cv2.CV_64F, 1, 0, ksize=3)
-    grad_y = cv2.Sobel(gris, cv2.CV_64F, 0, 1, ksize=3)
-    grad = cv2.magnitude(grad_x, grad_y)
-    grad = np.uint8(np.clip(grad / grad.max() * 255, 0, 255))
-    _, seuil = cv2.threshold(grad, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    gris = cv2.GaussianBlur(gris, (5,5), 0)
+    gx = cv2.Sobel(gris, cv2.CV_64F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gris, cv2.CV_64F, 0, 1, ksize=3)
+    grad = cv2.magnitude(gx, gy)
+    mx = grad.max()
+    if mx > 0:
+        grad = np.uint8(np.clip(grad / mx * 255, 0, 255))
+        _, seuil = cv2.threshold(grad, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        k2 = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 3))
+        seuil = cv2.morphologyEx(seuil, cv2.MORPH_CLOSE, k2)
+        contours2, _ = cv2.findContours(seuil, cv2.RETR_EXTERNAL,
+                                        cv2.CHAIN_APPROX_SIMPLE)
+        for c in contours2:
+            if cv2.contourArea(c) < 600: continue
+            x, y, w, hh = cv2.boundingRect(c)
+            if hh == 0: continue
+            ratio = w / hh
+            sr = 1.0 - abs(ratio - 4.6) / 4.6
+            if sr < 0.22: continue
+            candidates.append({'x':x,'y':y,'w':w,'h':hh,'score':sr*0.5,'methode':'gradient'})
 
-    kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 3))
-    seuil = cv2.morphologyEx(seuil, cv2.MORPH_CLOSE, kernel_h)
-    contours2, _ = cv2.findContours(seuil, cv2.RETR_EXTERNAL,
-                                    cv2.CHAIN_APPROX_SIMPLE)
-    for c in contours2:
-        aire = cv2.contourArea(c)
-        if aire < 800:
-            continue
-        x, y, w, hh = cv2.boundingRect(c)
-        if hh == 0:
-            continue
-        ratio = w / hh
-        score_ratio = 1.0 - abs(ratio - 4.6) / 4.6
-        if score_ratio < 0.25:
-            continue
-        candidates.append({
-            'x': x, 'y': y, 'w': w, 'h': hh,
-            'score': score_ratio * 0.5, 'methode': 'gradient', 'angle': 0
-        })
-
-    # Trier par score décroissant
     candidates.sort(key=lambda c: -c['score'])
-
-    if debug:
-        _debug_show("Gradient seuillé", seuil)
-
-    return candidates[:5]   # garder les 5 meilleures
+    return candidates[:6]
 
 
 # ══════════════════════════════════════════════════════════════
-#  ÉTAPE 2 — Correction de perspective / angle
+#  PRÉTRAITEMENT ROI — amélioré pour EasyOCR
 # ══════════════════════════════════════════════════════════════
-def corriger_perspective(img_bgr, x, y, w, h, marge=8):
+
+def pretraiter_pour_easyocr(img_bgr, x, y, w, h):
     """
-    Redresse la plaque si elle est prise en angle.
-    Utilise la transformation de perspective de OpenCV.
+    Extrait et prépare la ROI de la plaque pour EasyOCR.
+
+    Différences clés vs Tesseract :
+      - EasyOCR préfère l'image en couleur BGR (pas de binarisation forcée)
+      - On upscale à une largeur fixe de 400px (optimal pour le modèle)
+      - CLAHE appliqué sur le canal L (Lab) pour préserver les couleurs
+      - On retourne DEUX variantes : couleur + niveaux de gris rehaussés
     """
-    # Ajouter une marge autour de la ROI
-    x1 = max(0, x - marge)
-    y1 = max(0, y - marge)
+    marge = max(6, int(h * 0.12))
+    x1 = max(0, x - marge);  y1 = max(0, y - marge)
     x2 = min(img_bgr.shape[1], x + w + marge)
     y2 = min(img_bgr.shape[0], y + h + marge)
     roi = img_bgr[y1:y2, x1:x2]
 
-    gris = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    _, bin_ = cv2.threshold(gris, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if roi.size == 0:
+        return []
 
-    contours, _ = cv2.findContours(bin_, cv2.RETR_EXTERNAL,
-                                   cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return roi
-
-    # Chercher le plus grand contour quadrilatéral
-    c_max = max(contours, key=cv2.contourArea)
-    epsilon = 0.02 * cv2.arcLength(c_max, True)
-    poly = cv2.approxPolyDP(c_max, epsilon, True)
-
-    if len(poly) == 4:
-        pts = poly.reshape(4, 2).astype(np.float32)
-        # Ordonner : haut-gauche, haut-droite, bas-droite, bas-gauche
-        pts_ord = _ordonner_points(pts)
-        (tl, tr, br, bl) = pts_ord
-        larg = int(max(np.linalg.norm(tr - tl), np.linalg.norm(br - bl)))
-        haut = int(max(np.linalg.norm(tl - bl), np.linalg.norm(tr - br)))
-        dst = np.array([[0,0],[larg-1,0],[larg-1,haut-1],[0,haut-1]],
-                       dtype=np.float32)
-        M = cv2.getPerspectiveTransform(pts_ord, dst)
-        roi = cv2.warpPerspective(roi, M, (larg, haut))
-
-    return roi
-
-
-def _ordonner_points(pts):
-    rect = np.zeros((4, 2), dtype=np.float32)
-    s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]   # haut-gauche
-    rect[2] = pts[np.argmax(s)]   # bas-droite
-    diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)] # haut-droite
-    rect[3] = pts[np.argmax(diff)] # bas-gauche
-    return rect
-
-
-# ══════════════════════════════════════════════════════════════
-#  ÉTAPE 3 — Prétraitement avancé pour OCR plaque
-# ══════════════════════════════════════════════════════════════
-def pretraiter_plaque(roi_bgr, debug=False):
-    """
-    Pipeline de prétraitement optimisé pour les plaques :
-      - Upscaling ×3 (Tesseract travaille mieux ≥ 300px de haut)
-      - Débruitage
-      - Contraste CLAHE
-      - Binarisation Otsu
-      - Érosion légère pour séparer les caractères collés
-    Retourne plusieurs variantes (Tesseract vote sur la meilleure).
-    """
-    # Upscaling ×3 interpolation cubique
-    h, w = roi_bgr.shape[:2]
-    roi_bgr = cv2.resize(roi_bgr, (w * 3, h * 3),
+    # ── Redimensionner à largeur cible 400px ──────────────────
+    rh, rw = roi.shape[:2]
+    if rw == 0: return []
+    cible_w = 400
+    scale   = cible_w / rw
+    roi_r   = cv2.resize(roi, (cible_w, max(1, int(rh * scale))),
                          interpolation=cv2.INTER_CUBIC)
 
-    gris = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
+    # ── Variante 1 : couleur + CLAHE sur luminosité ───────────
+    lab   = cv2.cvtColor(roi_r, cv2.COLOR_BGR2Lab)
+    l, a, b_ch = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=3.5, tileGridSize=(4, 4))
+    l_eq  = clahe.apply(l)
+    lab_eq = cv2.merge([l_eq, a, b_ch])
+    v1_color = cv2.cvtColor(lab_eq, cv2.COLOR_Lab2BGR)
 
-    # Débruitage non-local means (conserve mieux les bords)
-    gris = cv2.fastNlMeansDenoising(gris, h=10, templateWindowSize=7,
-                                    searchWindowSize=21)
+    # ── Variante 2 : niveaux de gris débruités + sharpen ─────
+    gris = cv2.cvtColor(roi_r, cv2.COLOR_BGR2GRAY)
+    gris = cv2.fastNlMeansDenoising(gris, h=9,
+                                    templateWindowSize=7, searchWindowSize=15)
+    # Netteté (unsharp mask)
+    blur  = cv2.GaussianBlur(gris, (0, 0), 2)
+    sharp = cv2.addWeighted(gris, 1.6, blur, -0.6, 0)
+    v2_gray = cv2.cvtColor(sharp, cv2.COLOR_GRAY2BGR)
 
-    # CLAHE — améliore le contraste local (utile si éclairage inégal)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
-    gris_clahe = clahe.apply(gris)
-
-    variantes = {}
-
-    # V1 : Otsu simple
-    _, v1 = cv2.threshold(gris_clahe, 0, 255,
-                          cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    variantes['otsu'] = v1
-
-    # V2 : Otsu inversé (plaque foncée sur fond clair)
-    variantes['otsu_inv'] = cv2.bitwise_not(v1)
-
-    # V3 : Seuillage adaptatif (meilleur si éclairage non uniforme)
-    v3 = cv2.adaptiveThreshold(gris_clahe, 255,
-                                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                cv2.THRESH_BINARY, 19, 9)
-    variantes['adaptatif'] = v3
-
-    # V4 : Morphologie pour nettoyer
-    kernel = np.ones((2, 2), np.uint8)
-    v4 = cv2.morphologyEx(v1, cv2.MORPH_OPEN, kernel)
-    variantes['morph'] = v4
-
-    if debug:
-        for nom, img in variantes.items():
-            _debug_show(f"Prétraitement : {nom}", img)
-
-    return variantes
+    return [v1_color, v2_gray]
 
 
 # ══════════════════════════════════════════════════════════════
-#  ÉTAPE 4 — OCR + corrections caractères
+#  CORRECTIONS CARACTÈRES (identique à l'original)
 # ══════════════════════════════════════════════════════════════
 
-# Config Tesseract pour plaque sur une ligne
-# PSM 7 = ligne unique  |  PSM 8 = mot unique
-# Whitelist : uniquement les caractères autorisés dans une plaque belge
-TESS_CONFIGS = [
-    r'--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-',
-    r'--oem 3 --psm 8 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-',
-    r'--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-',
-]
+def _forcer_chiffre(c):
+    M = {'O':'0','Q':'0','D':'0','I':'1','L':'1','l':'1',
+         'Z':'2','S':'5','G':'6','B':'8','g':'9','A':'4'}
+    return M.get(c.upper(), c) if not c.isdigit() else c
 
-def ocr_plaque(variantes: dict) -> list[dict]:
-    """
-    Lance Tesseract sur chaque variante d'image avec plusieurs configs.
-    Retourne tous les résultats uniques triés par score de validité.
-    """
-    resultats = {}
+def _forcer_lettre(c):
+    M = {'0':'O','1':'I','5':'S','6':'G','8':'B','4':'A'}
+    return M.get(c, c) if not c.isalpha() else c
 
-    for nom_img, img in variantes.items():
-        # Ajouter une bordure blanche (Tesseract aime les marges)
-        img_m = cv2.copyMakeBorder(img, 20, 20, 20, 20,
-                                   cv2.BORDER_CONSTANT, value=255)
-        for cfg in TESS_CONFIGS:
-            try:
-                texte = pytesseract.image_to_string(
-                    img_m, config=cfg, lang='eng'
-                ).strip().upper()
-
-                # Nettoyer : garder uniquement alphanum et tirets
-                texte = re.sub(r'[^A-Z0-9\-]', '', texte)
-                if not texte:
-                    continue
-
-                texte_corr = corriger_caracteres(texte)
-                score = scorer_plaque(texte_corr)
-
-                cle = texte_corr
-                if cle not in resultats or score > resultats[cle]['score']:
-                    resultats[cle] = {
-                        'texte':     texte_corr,
-                        'brut':      texte,
-                        'score':     score,
-                        'valide':    est_valide(texte_corr),
-                        'variante':  f"{nom_img}",
-                    }
-            except Exception:
-                continue
-
-    return sorted(resultats.values(), key=lambda r: -r['score'])
-
-
-def corriger_caracteres(texte: str) -> str:
-    """
-    Corrige les confusions OCR en tenant compte de la POSITION
-    dans le format belge 1-ABC-234 :
-      pos 0  → chiffre obligatoire
-      pos 2-4 → lettres obligatoires
-      pos 6-8 → chiffres obligatoires
-    """
-    # Normaliser les tirets (OCR lit parfois _ ou espace)
-    texte = re.sub(r'[\s_–—]', '-', texte)
-    # Supprimer les tirets en trop en début/fin
-    texte = texte.strip('-')
-
-    # Correction position par position si format complet
+def corriger_caracteres(texte):
+    texte = re.sub(r'[\s_–—.]', '-', texte).strip('-').upper()
+    # Supprimer double tirets
+    texte = re.sub(r'-{2,}', '-', texte)
     if len(texte) == 9 and texte[1] == '-' and texte[5] == '-':
         chars = list(texte)
-        # Position 0 : doit être un chiffre
         chars[0] = _forcer_chiffre(chars[0])
-        # Positions 2,3,4 : doivent être des lettres
-        for i in (2, 3, 4):
-            chars[i] = _forcer_lettre(chars[i])
-        # Positions 6,7,8 : doivent être des chiffres
-        for i in (6, 7, 8):
-            chars[i] = _forcer_chiffre(chars[i])
+        for i in (2, 3, 4): chars[i] = _forcer_lettre(chars[i])
+        for i in (6, 7, 8): chars[i] = _forcer_chiffre(chars[i])
         return ''.join(chars)
+    return texte
 
-    # Sinon : correction générique
-    return ''.join(CORRECTIONS_OCR.get(c, c) for c in texte)
-
-
-def _forcer_chiffre(c: str) -> str:
-    """Convertit un caractère en chiffre si c'est une confusion connue."""
-    MAP = {'O':'0','Q':'0','D':'0','I':'1','L':'1','l':'1',
-           'Z':'2','S':'5','G':'6','B':'8','g':'9','A':'4'}
-    return MAP.get(c, c) if not c.isdigit() else c
-
-
-def _forcer_lettre(c: str) -> str:
-    """Convertit un caractère en lettre si c'est une confusion connue."""
-    MAP = {'0':'O','1':'I','5':'S','6':'G','8':'B','4':'A'}
-    return MAP.get(c, c) if not c.isalpha() else c
-
-
-def scorer_plaque(texte: str) -> float:
-    """
-    Score entre 0 et 1 mesurant la probabilité que le texte
-    soit une plaque belge valide.
-    """
-    if not texte:
-        return 0.0
-
+def scorer_plaque(texte):
+    if not texte: return 0.0
+    if PATTERN_NOUVELLE.match(texte): return 1.0
+    if PATTERN_ANCIENNE.match(texte): return 0.85
     score = 0.0
-
-    # Format nouvelle plaque (max score)
-    if PATTERN_NOUVELLE.match(texte):
-        return 1.0
-
-    # Format ancienne plaque
-    if PATTERN_ANCIENNE.match(texte):
-        return 0.85
-
-    # Longueur correcte
-    if len(texte) == 9:
-        score += 0.3
-    elif len(texte) == 7:
-        score += 0.2
-
-    # Tirets aux bonnes positions
-    if len(texte) > 1 and texte[1] == '-':
-        score += 0.2
-    if len(texte) > 5 and texte[5] == '-':
-        score += 0.2
-
-    # Contient au moins un chiffre et une lettre
-    if re.search(r'\d', texte):
-        score += 0.1
-    if re.search(r'[A-Z]', texte):
-        score += 0.1
-
+    if len(texte) == 9: score += 0.3
+    elif len(texte) == 7: score += 0.2
+    if len(texte) > 1 and texte[1] == '-': score += 0.2
+    if len(texte) > 5 and texte[5] == '-': score += 0.2
+    if re.search(r'\d', texte):    score += 0.1
+    if re.search(r'[A-Z]', texte): score += 0.1
     return min(score, 0.99)
 
-
-def est_valide(texte: str) -> bool:
+def est_valide(texte):
     return bool(PATTERN_NOUVELLE.match(texte) or PATTERN_ANCIENNE.match(texte))
 
 
 # ══════════════════════════════════════════════════════════════
-#  ÉTAPE 5 — Annotation et affichage
+#  OCR EASYOCR
 # ══════════════════════════════════════════════════════════════
-def annoter_image(img_bgr, candidates, resultats_par_candidate):
-    """Dessine les zones détectées et les textes reconnus."""
-    out = img_bgr.copy()
 
-    for i, cand in enumerate(candidates):
-        res_list = resultats_par_candidate.get(i, [])
-        meilleur = res_list[0] if res_list else None
+def ocr_easyocr(reader, variantes_roi):
+    """
+    Lance EasyOCR sur chaque variante de ROI.
 
-        x, y, w, h = cand['x'], cand['y'], cand['w'], cand['h']
-        couleur = (0, 200, 0) if (meilleur and meilleur['valide']) else (0, 165, 255)
+    Paramètres clés EasyOCR pour plaques :
+      - allowlist     : restreint aux caractères possibles (comme Tesseract whitelist)
+      - paragraph     : False → chaque mot est traité séparément
+      - min_size      : ignore les textes trop petits
+      - contrast_ths  : seuil de contraste plus permissif pour plaques
+      - adjust_contrast : rehaussement auto si contraste insuffisant
+      - text_threshold : confiance minimale pour accepter un résultat
+    """
+    resultats = {}
+    ALLOWLIST = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-'
 
-        cv2.rectangle(out, (x, y), (x + w, y + h), couleur, 2)
+    for roi_bgr in variantes_roi:
+        try:
+            detections = reader.readtext(
+                roi_bgr,
+                allowlist      = ALLOWLIST,
+                paragraph      = False,
+                min_size       = 10,
+                contrast_ths   = 0.2,       # plus permissif que défaut (0.1)
+                adjust_contrast= 0.6,       # rehausse si contraste < 0.6
+                text_threshold = 0.55,      # confiance min (défaut 0.7, on baisse)
+                low_text       = 0.35,      # détecte les caractères peu contrastés
+                width_ths      = 0.8,       # fusionne les mots proches
+            )
 
-        label = meilleur['texte'] if meilleur else '?'
-        score_txt = f" ({meilleur['score']:.0%})" if meilleur else ''
+            # Fusionner tous les fragments sur la même ligne
+            fragments = [d[1].strip().upper() for d in detections if d[2] > 0.3]
+            if not fragments:
+                continue
 
-        # Fond du label
-        (lw, lh), _ = cv2.getTextSize(label + score_txt,
-                                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
-        ly = max(y - 8, lh + 8)
-        cv2.rectangle(out, (x, ly - lh - 6), (x + lw + 8, ly + 4),
-                      couleur, -1)
-        cv2.putText(out, label + score_txt, (x + 4, ly - 2),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+            # Reconstituer le texte complet de la plaque
+            texte_brut = ''.join(re.sub(r'[^A-Z0-9\-]', '', f) for f in fragments)
+            if not texte_brut:
+                continue
 
+            texte = corriger_caracteres(texte_brut)
+
+            # Si le format n'a pas de tirets, tenter de les insérer
+            if '-' not in texte and len(texte) == 7:
+                # Format nouvelle plaque sans tirets : 1ABC234 → 1-ABC-234
+                texte = f"{texte[0]}-{texte[1:4]}-{texte[4:7]}"
+
+            score = scorer_plaque(texte)
+
+            if texte not in resultats or score > resultats[texte]['score']:
+                # Confiance EasyOCR moyenne sur les fragments
+                conf_moy = sum(d[2] for d in detections) / len(detections) if detections else 0
+                resultats[texte] = {
+                    'texte':  texte,
+                    'score':  score,
+                    'conf':   conf_moy,
+                    'valide': est_valide(texte),
+                }
+        except Exception:
+            continue
+
+    return sorted(resultats.values(), key=lambda r: -r['score'])
+
+
+# ══════════════════════════════════════════════════════════════
+#  ANALYSER UNE FRAME
+# ══════════════════════════════════════════════════════════════
+
+def analyser_frame(frame, reader):
+    """Pipeline complet sur une frame : détection → prétraitement → EasyOCR."""
+    candidates = detecter_zone_plaque(frame)
+    detections = []
+
+    for cand in candidates:
+        variantes = pretraiter_pour_easyocr(
+            frame, cand['x'], cand['y'], cand['w'], cand['h']
+        )
+        if not variantes:
+            continue
+        resultats = ocr_easyocr(reader, variantes)
+        if resultats:
+            best = resultats[0]
+            detections.append({**best,
+                                'x': cand['x'], 'y': cand['y'],
+                                'w': cand['w'],  'h': cand['h']})
+    return detections
+
+
+# ══════════════════════════════════════════════════════════════
+#  RENDU HUD
+# ══════════════════════════════════════════════════════════════
+
+def dessiner_frame(frame, detections, etat):
+    out  = frame.copy()
+    hf, wf = out.shape[:2]
+
+    for det in detections:
+        x, y, w, hh  = det['x'], det['y'], det['w'], det['h']
+        couleur      = CLR_VALIDE if det['valide'] else CLR_CANDIDAT
+        epaisseur    = 3 if det['valide'] else 2
+
+        cv2.rectangle(out, (x, y), (x+w, y+hh), couleur, epaisseur)
+
+        # Coins stylisés
+        tc = min(w, hh) // 4
+        for (px, py), (dx, dy) in [
+            ((x,   y),      ( 1,  1)), ((x+w, y),      (-1,  1)),
+            ((x,   y+hh),   ( 1, -1)), ((x+w, y+hh),   (-1, -1)),
+        ]:
+            cv2.line(out, (px, py), (px + dx*tc, py),    couleur, 4)
+            cv2.line(out, (px, py), (px, py + dy*tc),    couleur, 4)
+
+        label = f"{det['texte']}  {det['score']:.0%}"
+        font  = cv2.FONT_HERSHEY_DUPLEX
+        (lw, lh), bl = cv2.getTextSize(label, font, 0.9, 2)
+        ly = max(y - 12, lh + 8)
+        overlay = out.copy()
+        cv2.rectangle(overlay, (x, ly-lh-8), (x+lw+12, ly+bl+2), couleur, -1)
+        cv2.addWeighted(overlay, 0.75, out, 0.25, 0, out)
+        cv2.putText(out, label, (x+6, ly-2), font, 0.9, (10,10,10), 2)
+
+    # ── HUD bas ───────────────────────────────────────────────
+    hud_h = 54
+    ov2 = out.copy()
+    cv2.rectangle(ov2, (0, hf-hud_h), (wf, hf), CLR_OVERLAY, -1)
+    cv2.addWeighted(ov2, 0.70, out, 0.30, 0, out)
+
+    cv2.putText(out, f"SOURCE: {etat['source']}",
+                (12, hf-hud_h+20), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (170,170,170), 1)
+    cv2.putText(out, f"MOTEUR: EasyOCR",
+                (12, hf-hud_h+38), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (100,200,100), 1)
+    cv2.putText(out, f"UNIQUES: {etat['nb_valides']}",
+                (220, hf-hud_h+20), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (170,170,170), 1)
+
+    if etat['derniere_valide']:
+        txt = f"DERNIERE: {etat['derniere_valide']['texte']}"
+        (tw,_),_ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_DUPLEX, 0.78, 2)
+        cv2.putText(out, txt, (wf//2 - tw//2, hf-8),
+                    cv2.FONT_HERSHEY_DUPLEX, 0.78, CLR_VALIDE, 2)
+
+    if etat['pause']:
+        ptxt = "|| PAUSE  [ESPACE pour reprendre]"
+        (pw,_),_ = cv2.getTextSize(ptxt, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
+        cv2.putText(out, ptxt, (wf-pw-12, hf-hud_h+22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, CLR_PAUSE, 2)
+    else:
+        rtxt = "ESPACE=pause  |  Q=quitter"
+        (rw,_),_ = cv2.getTextSize(rtxt, cv2.FONT_HERSHEY_SIMPLEX, 0.50, 1)
+        cv2.putText(out, rtxt, (wf-rw-12, hf-hud_h+22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, (120,120,120), 1)
+
+    cv2.putText(out, datetime.now().strftime("%H:%M:%S"),
+                (wf-88, hf-8), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (140,140,140), 1)
     return out
 
 
-def afficher(img_cv, titre="Résultat", chemin_fallback="resultat_plaque.png"):
-    h, w = img_cv.shape[:2]
-    if max(h, w) > 1100:
-        s = 1100 / max(h, w)
-        img_cv = cv2.resize(img_cv, (int(w*s), int(h*s)))
-    try:
-        cv2.imshow(titre, img_cv)
-        cv2.waitKey(0)
-        cv2.destroyAllWindows()
-    except cv2.error:
-        cv2.imwrite(chemin_fallback, img_cv)
-        print(f"{YLW}⚠  Pas d'écran → image sauvegardée : {chemin_fallback}{R}")
+# ══════════════════════════════════════════════════════════════
+#  WORKER OCR (thread séparé)
+# ══════════════════════════════════════════════════════════════
+
+class WorkerOCR(threading.Thread):
+    def __init__(self, q_in, q_out, reader):
+        super().__init__(daemon=True)
+        self.q_in  = q_in
+        self.q_out = q_out
+        self.reader = reader
+        self.actif  = True
+
+    def run(self):
+        while self.actif:
+            try:
+                frame = self.q_in.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                dets = analyser_frame(frame, self.reader)
+                while not self.q_out.empty():
+                    try: self.q_out.get_nowait()
+                    except queue.Empty: break
+                self.q_out.put(dets)
+            except Exception:
+                pass
+
+    def arreter(self):
+        self.actif = False
 
 
-def _debug_show(titre, img):
-    try:
-        cv2.imshow(titre, img)
-        cv2.waitKey(500)
-    except cv2.error:
-        pass
+# ══════════════════════════════════════════════════════════════
+#  BOUCLE VIDÉO PRINCIPALE
+# ══════════════════════════════════════════════════════════════
+
+def boucle_video(cap, nom_source, reader):
+    q_in   = queue.Queue(maxsize=2)
+    q_out  = queue.Queue(maxsize=2)
+    worker = WorkerOCR(q_in, q_out, reader)
+    worker.start()
+
+    etat = {
+        'source':          nom_source,
+        'pause':           False,
+        'nb_valides':      0,
+        'derniere_valide': None,
+        'plaques_vues':    set(),
+    }
+
+    detections_courantes = []
+    frame_pause          = None
+    derniere_envoi       = 0
+    fenetre              = "🚗 Plaques Belges — EasyOCR"
+
+    print(f"\n{CYAN}{B}🎥 Lecture démarrée : {nom_source}{RS}")
+    print(f"{GRY}   ESPACE = pause/reprise  |  Q = quitter{RS}\n")
+
+    while True:
+        # ── Pause ────────────────────────────────────────────
+        if etat['pause']:
+            cv2.imshow(fenetre, dessiner_frame(frame_pause, detections_courantes, etat))
+            key = cv2.waitKey(30) & 0xFF
+            if key == ord(' '):
+                etat['pause'] = False
+                print(f"{GRN}▶  Reprise{RS}")
+            elif key in (ord('q'), ord('Q'), 27):
+                break
+            continue
+
+        # ── Lecture frame ─────────────────────────────────────
+        ret, frame = cap.read()
+        if not ret:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            continue
+
+        # ── Envoi au worker ───────────────────────────────────
+        now = time.time()
+        if now - derniere_envoi > 0.08 and not q_in.full():
+            q_in.put(frame.copy())
+            derniere_envoi = now
+
+        # ── Récupérer résultats ───────────────────────────────
+        try:
+            nouvelles = q_out.get_nowait()
+            detections_courantes = nouvelles
+            for det in nouvelles:
+                if det['valide'] and det['texte'] not in etat['plaques_vues']:
+                    etat['plaques_vues'].add(det['texte'])
+                    etat['nb_valides']     += 1
+                    etat['derniere_valide'] = det
+                    ts = datetime.now().strftime("%H:%M:%S")
+                    print(f"  {GRN}✅ [{ts}]  {B}{det['texte']}{RS}"
+                          f"  (score {det['score']:.0%},"
+                          f" conf EasyOCR {det['conf']:.0%})")
+        except queue.Empty:
+            pass
+
+        # ── Affichage ─────────────────────────────────────────
+        frame_out = dessiner_frame(frame, detections_courantes, etat)
+        hf, wf = frame_out.shape[:2]
+        if max(hf, wf) > 1280:
+            s = 1280 / max(hf, wf)
+            frame_out = cv2.resize(frame_out, (int(wf*s), int(hf*s)))
+        cv2.imshow(fenetre, frame_out)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord(' '):
+            etat['pause']  = True
+            frame_pause    = frame.copy()
+            print(f"{YLW}⏸  Pause{RS}")
+        elif key in (ord('q'), ord('Q'), 27):
+            break
+
+    worker.arreter()
+    cap.release()
+    cv2.destroyAllWindows()
+
+    # ── Bilan ─────────────────────────────────────────────────
+    print(f"\n{'─'*50}")
+    print(f"{CYAN}{B}📊 Bilan de session — EasyOCR{RS}")
+    print(f"   Plaques uniques : {etat['nb_valides']}")
+    for p in sorted(etat['plaques_vues']):
+        print(f"   {GRN}• {p}{RS}")
+    print()
 
 
 # ══════════════════════════════════════════════════════════════
 #  MAIN
 # ══════════════════════════════════════════════════════════════
+
+def banner():
+    print(f"""
+{CYAN}{B}╔══════════════════════════════════════════════════════╗
+║   🎥 Lecteur Plaques Belges — EasyOCR Edition       ║
+║   Précision améliorée pour vidéo / flou / distance  ║
+╚══════════════════════════════════════════════════════╝{RS}
+""")
+
 def main():
     banner()
 
-    parser = argparse.ArgumentParser(description="Lecteur de plaques belges optimisé")
-    parser.add_argument('image', help='Chemin image (jpg/png)')
-    parser.add_argument('--save',  metavar='FICHIER', help='Sauvegarder l\'image annotée')
-    parser.add_argument('--debug', action='store_true', help='Afficher chaque étape de traitement')
+    parser = argparse.ArgumentParser(
+        description="Détection plaques belges — moteur EasyOCR",
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+    groupe = parser.add_mutually_exclusive_group(required=True)
+    groupe.add_argument('--webcam', metavar='ID', nargs='?', const=0, type=int,
+                        help='Webcam (0 par défaut)')
+    groupe.add_argument('--video', metavar='FICHIER',
+                        help='Fichier vidéo (mp4, avi, mkv...)')
     args = parser.parse_args()
 
-    if not os.path.isfile(args.image):
-        print(f"{RED}[ERREUR] Fichier introuvable : {args.image}{R}")
-        sys.exit(1)
+    # ── Initialisation EasyOCR ────────────────────────────────
+    reader = init_reader()
 
-    img = cv2.imread(args.image)
-    if img is None:
-        print(f"{RED}[ERREUR] Impossible de lire l'image.{R}")
-        sys.exit(1)
-
-    print(f"{CYAN}📂 Image chargée : {args.image}  ({img.shape[1]}×{img.shape[0]} px){R}\n")
-
-    # ── 1. Détection des zones plaque ─────────────────────────
-    print(f"{CYAN}🔍 Détection des zones plaque...{R}")
-    candidates = detecter_zone_plaque(img, debug=args.debug)
-
-    if not candidates:
-        print(f"{YLW}⚠  Aucune zone plaque trouvée. Tentative OCR sur image complète.{R}")
-        candidates = [{'x': 0, 'y': 0, 'w': img.shape[1],
-                       'h': img.shape[0], 'score': 0.1, 'methode': 'full', 'angle': 0}]
+    # ── Ouverture source ──────────────────────────────────────
+    if args.webcam is not None:
+        idx = args.webcam
+        print(f"{CYAN}📷 Ouverture webcam #{idx}...{RS}")
+        cap = cv2.VideoCapture(idx)
+        if not cap.isOpened():
+            print(f"{RED}[ERREUR] Webcam #{idx} introuvable.{RS}")
+            sys.exit(1)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT,  720)
+        cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
+        nom_source = f"Webcam #{idx}"
     else:
-        print(f"   {len(candidates)} zone(s) candidate(s) détectée(s).\n")
+        chemin = args.video
+        if not os.path.isfile(chemin):
+            print(f"{RED}[ERREUR] Fichier introuvable : {chemin}{RS}")
+            sys.exit(1)
+        cap = cv2.VideoCapture(chemin)
+        if not cap.isOpened():
+            print(f"{RED}[ERREUR] Impossible d'ouvrir : {chemin}{RS}")
+            sys.exit(1)
+        fps   = cap.get(cv2.CAP_PROP_FPS)
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        print(f"{CYAN}🎬 Vidéo : {chemin}{RS}")
+        print(f"   {total} frames  |  {fps:.1f} FPS  |  "
+              f"{total/fps:.1f}s\n" if fps > 0 else "\n")
+        nom_source = os.path.basename(chemin)
 
-    # ── 2-4. Correction + prétraitement + OCR par candidate ───
-    resultats_par_candidate = {}
-    tous_resultats = []
-
-    for i, cand in enumerate(candidates):
-        print(f"{CYAN}🔧 Traitement zone #{i+1}  "
-              f"[méthode: {cand['methode']}, score: {cand['score']:.2f}]{R}")
-
-        # Correction de perspective
-        roi = corriger_perspective(img, cand['x'], cand['y'],
-                                   cand['w'], cand['h'])
-        if args.debug:
-            _debug_show(f"ROI corrigée #{i+1}", roi)
-
-        # Prétraitement
-        variantes = pretraiter_plaque(roi, debug=args.debug)
-
-        # OCR
-        resultats = ocr_plaque(variantes)
-        resultats_par_candidate[i] = resultats
-
-        for r in resultats[:3]:
-            valide_txt = f"{GRN}✅ VALIDE{R}" if r['valide'] else f"{YLW}~{R}"
-            print(f"   {valide_txt}  {B}{r['texte']}{R}  "
-                  f"(confiance: {r['score']:.0%})")
-            tous_resultats.append(r)
-
-        print()
-
-    # ── Résultat final ─────────────────────────────────────────
-    valides = [r for r in tous_resultats if r['valide']]
-    valides.sort(key=lambda r: -r['score'])
-
-    print(f"{'─'*50}")
-    if valides:
-        best = valides[0]
-        print(f"\n{GRN}{B}🏆 Plaque détectée : {best['texte']}{R}  "
-              f"(confiance {best['score']:.0%})\n")
-    else:
-        non_valides = sorted(tous_resultats, key=lambda r: -r['score'])
-        if non_valides:
-            best = non_valides[0]
-            print(f"\n{YLW}⚠  Meilleure tentative (format non standard) : "
-                  f"{B}{best['texte']}{R}  ({best['score']:.0%})\n")
-            print(f"{GRY}   Conseils si le résultat est mauvais :{R}")
-            print(f"{GRY}   • Utilisez une image plus proche / mieux éclairée{R}")
-            print(f"{GRY}   • Essayez --debug pour voir les étapes{R}")
-        else:
-            print(f"\n{RED}❌ Aucun texte lisible détecté.{R}\n")
-
-    # ── Annotation image ───────────────────────────────────────
-    img_annotee = annoter_image(img, candidates, resultats_par_candidate)
-
-    chemin_sortie = args.save or "resultat_plaque.png"
-    if args.save:
-        cv2.imwrite(chemin_sortie, img_annotee)
-        print(f"{GRN}💾 Image annotée sauvegardée : {chemin_sortie}{R}\n")
-
-    afficher(img_annotee, chemin_fallback=chemin_sortie)
+    boucle_video(cap, nom_source, reader)
 
 
 if __name__ == '__main__':
