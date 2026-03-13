@@ -155,7 +155,6 @@ def extraire_lignes_numeriques(image_pil):
     return lignes_numeriques, texte_brut
 
 
-
 def afficher_resultats(lignes):
 
     if not lignes:
