@@ -416,7 +416,6 @@ class WorkerOCR(threading.Thread):
     def arreter(self):
         self.actif = False
 
-
 # ══════════════════════════════════════════════════════════════
 #  BOUCLE VIDÉO PRINCIPALE
 # ══════════════════════════════════════════════════════════════
