@@ -170,32 +170,52 @@ def _forcer_lettre(c):
     return M.get(c,c) if not c.isalpha() else c
 
 def corriger(texte):
-    texte = re.sub(r'[\s_]','-',texte).strip('-')
-    texte = re.sub(r'-{2,}','-',texte)
-    # Reconstruire si 7 chars sans tirets
-    if len(texte)==7 and '-' not in texte:
+    texte = re.sub(r'[\s_]', '-', texte).strip('-')
+    texte = re.sub(r'-{2,}', '-', texte)
+
+    # Supprimer le préfixe "B" ou lettre isolée du logo belge
+    # ex: "E2-DJS-209" → "2-DJS-209"  |  "B1-BEM-244" → "1-BEM-244"
+    if len(texte) >= 2 and texte[0].isalpha() and (texte[1].isdigit() or texte[1] == '-'):
+        texte = texte[1:]
+    if texte.startswith('-'):
+        texte = texte[1:]
+
+    # Reconstruire si 7 chars sans tirets : "1BEM244" → "1-BEM-244"
+    if len(texte) == 7 and '-' not in texte:
         texte = f"{texte[0]}-{texte[1:4]}-{texte[4:7]}"
-    if len(texte)==9 and texte[1]=='-' and texte[5]=='-':
+
+    # Reconstruire si 8 chars avec 1 tiret au mauvais endroit
+    # ex: "2-DS209" ou "2DJS-209"
+    if len(texte) == 8 and texte.count('-') == 1:
+        texte = texte.replace('-', '')
+        if len(texte) == 7:
+            texte = f"{texte[0]}-{texte[1:4]}-{texte[4:7]}"
+
+    # Correction position par position si format 9 chars
+    if len(texte) == 9 and texte[1] == '-' and texte[5] == '-':
         c = list(texte)
         c[0] = _forcer_chiffre(c[0])
-        for i in (2,3,4): c[i] = _forcer_lettre(c[i])
-        for i in (6,7,8): c[i] = _forcer_chiffre(c[i])
-        if c[8]=='-': c[8]='4'
+        for i in (2, 3, 4): c[i] = _forcer_lettre(c[i])
+        for i in (6, 7, 8): c[i] = _forcer_chiffre(c[i])
+        if c[8] == '-': c[8] = '4'
         return ''.join(c)
+
     return texte
+
 
 def scorer(texte):
     if not texte: return 0.0
     if PATTERN_NOUVELLE.match(texte): return 1.0
     if PATTERN_ANCIENNE.match(texte): return 0.85
-    s=0.0
-    if len(texte)==9: s+=0.3
-    elif len(texte)==7: s+=0.2
-    if len(texte)>1 and texte[1]=='-': s+=0.2
-    if len(texte)>5 and texte[5]=='-': s+=0.2
-    if re.search(r'\d',texte): s+=0.1
-    if re.search(r'[A-Z]',texte): s+=0.1
-    return min(s,0.99)
+    s = 0.0
+    if len(texte) == 9: s += 0.3
+    elif len(texte) == 7: s += 0.2
+    if len(texte) > 1 and texte[1] == '-': s += 0.2
+    if len(texte) > 5 and texte[5] == '-': s += 0.2
+    if re.search(r'\d', texte): s += 0.1
+    if re.search(r'[A-Z]', texte): s += 0.1
+    return min(s, 0.99)
+
 
 def est_valide(texte):
     return bool(PATTERN_NOUVELLE.match(texte) or PATTERN_ANCIENNE.match(texte))
@@ -232,7 +252,7 @@ def analyser_frame(frame):
                                'x':z['x'],'y':z['y'],'w':z['w'],'h':z['h']})
             continue
         res = lire_plaque(variantes)
-        if res and res['score'] >= 0.4:
+        if res and res['score'] >= 0.3:
             resultats.append({**res,'ocr_ok':True,
                                'x':z['x'],'y':z['y'],'w':z['w'],'h':z['h']})
         else:
@@ -263,7 +283,7 @@ def dessiner(frame, detections, etat):
             cv2.line(out,(px,py),(px,py+dy*tc),col,3)
 
         # Label
-        if det['ocr_ok'] and det['texte']:
+        if det.get('ocr_ok') and det.get('texte','') not in ('', '...'):
             label = f"{det['texte']}  {det['score']:.0%}"
             (lw,lh),_ = cv2.getTextSize(label, cv2.FONT_HERSHEY_DUPLEX, 0.85, 2)
             # Position au-dessus ou à l'intérieur
@@ -334,14 +354,12 @@ def boucle(cap, nom_source):
     worker = WorkerOCR(q_in, q_out)
     worker.start()
 
-    etat = {'source':nom_source,'pause':False,'nb_valides':0,
-            'derniere_valide':None,'plaques_vues':set()}
+    etat = {
+        'source': nom_source, 'pause': False,
+        'nb_valides': 0, 'derniere_valide': None, 'plaques_vues': set()
+    }
 
-    # Détections visuelles (zones orange immédiates)
-    zones_visuelles = []
-    # Dernières détections OCR reçues
-    dets_ocr = []
-
+    dets_last     = []   # derniers résultats OCR (persistants)
     frame_pause   = None
     dernier_envoi = 0
     fenetre       = "Plaques Belges"
@@ -350,14 +368,16 @@ def boucle(cap, nom_source):
     print(f"{GRY}ESPACE=pause | Q=quitter{RS}\n")
 
     while True:
+
         # ── Pause ──────────────────────────────────────────────
         if etat['pause']:
-            cv2.imshow(fenetre, dessiner(frame_pause, dets_ocr, etat))
+            cv2.imshow(fenetre, dessiner(frame_pause, dets_last, etat))
             k = cv2.waitKey(30) & 0xFF
             if k == ord(' '):
                 etat['pause'] = False
                 print(f"{GRN}Reprise{RS}")
-            elif k in (ord('q'),ord('Q'),27): break
+            elif k in (ord('q'), ord('Q'), 27):
+                break
             continue
 
         # ── Lecture frame ───────────────────────────────────────
@@ -366,11 +386,13 @@ def boucle(cap, nom_source):
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             continue
 
-        # ── Détection visuelle directe (rectangles immédiats) ──
-        zones_visuelles = detecter_plaques(frame)
-        affichage = [{'texte':'','score':0,'valide':False,'ocr_ok':False,
-                      'x':z['x'],'y':z['y'],'w':z['w'],'h':z['h']}
-                     for z in zones_visuelles]
+        # ── Détection visuelle immédiate ────────────────────────
+        zones = detecter_plaques(frame)
+        affichage = [
+            {'texte':'','score':0,'valide':False,'ocr_ok':False,
+             'x':z['x'],'y':z['y'],'w':z['w'],'h':z['h']}
+            for z in zones
+        ]
 
         # ── Envoi au worker OCR ─────────────────────────────────
         now = time.time()
@@ -380,25 +402,46 @@ def boucle(cap, nom_source):
 
         # ── Récupérer résultats OCR ─────────────────────────────
         try:
-            dets_ocr = q_out.get_nowait()
-            for det in dets_ocr:
-                if det['ocr_ok'] and det['texte']:
-                    print(f"  OCR: [{det['texte']}] score={det['score']:.0%} valide={det['valide']}")
-                if det['valide'] and det['texte'] not in etat['plaques_vues']:
+            nouveaux = q_out.get_nowait()
+            dets_last = nouveaux
+            for det in dets_last:
+                if det.get('ocr_ok') and det.get('texte'):
+                    print(f"  OCR: [{det['texte']}] {det['score']:.0%} valide={det['valide']}")
+                if det.get('valide') and det['texte'] not in etat['plaques_vues']:
                     etat['plaques_vues'].add(det['texte'])
                     etat['nb_valides'] += 1
                     etat['derniere_valide'] = det
                     ts = datetime.now().strftime('%H:%M:%S')
-                    print(f"  {GRN}✅ [{ts}] {B}{det['texte']}{RS} ({det['score']:.0%})")
+                    print(f"  {GRN}[{ts}] {B}{det['texte']}{RS} ({det['score']:.0%})")
         except queue.Empty:
-            dets_ocr = affichage   # afficher zones visuelles en attendant
+            pass  # conserver dets_last intact
+
+        # ── Construire l'affichage final ────────────────────────
+        # Zones visuelles + labels OCR fusionnés
+        if dets_last:
+            # Utiliser les coords visuelles + texte OCR
+            dets_finaux = []
+            for z in affichage:
+                meilleur = None
+                for r in dets_last:
+                    if r.get('ocr_ok') and _iou(z, r) > 0.1:
+                        meilleur = r
+                        break
+                dets_finaux.append({**(meilleur if meilleur else z),
+                                    'x':z['x'],'y':z['y'],'w':z['w'],'h':z['h']})
+            # Ajouter les résultats OCR qui n'ont pas de zone visuelle correspondante
+            for r in dets_last:
+                if r.get('ocr_ok') and not any(_iou(r, z) > 0.1 for z in affichage):
+                    dets_finaux.append(r)
+        else:
+            dets_finaux = affichage
 
         # ── Rendu ───────────────────────────────────────────────
-        fa = dessiner(frame, dets_ocr, etat)
+        fa = dessiner(frame, dets_finaux, etat)
         H, W = fa.shape[:2]
-        if max(H,W) > 1280:
-            s = 1280/max(H,W)
-            fa = cv2.resize(fa,(int(W*s),int(H*s)))
+        if max(H, W) > 1280:
+            s = 1280 / max(H, W)
+            fa = cv2.resize(fa, (int(W*s), int(H*s)))
         cv2.imshow(fenetre, fa)
 
         k = cv2.waitKey(1) & 0xFF
@@ -406,7 +449,8 @@ def boucle(cap, nom_source):
             etat['pause'] = True
             frame_pause   = frame.copy()
             print(f"{YLW}Pause{RS}")
-        elif k in (ord('q'),ord('Q'),27): break
+        elif k in (ord('q'), ord('Q'), 27):
+            break
 
     worker.arreter()
     cap.release()
@@ -415,10 +459,6 @@ def boucle(cap, nom_source):
     for p in sorted(etat['plaques_vues']):
         print(f"  {GRN}* {p}{RS}")
 
-
-# ══════════════════════════════════════════════════════════════
-#  MAIN
-# ══════════════════════════════════════════════════════════════
 
 def main():
     print(f"\n{CYAN}{B}Lecteur Plaques Belges{RS}\n")
